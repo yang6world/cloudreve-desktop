@@ -1,4 +1,4 @@
-use crate::client::{Client, RequestOptions, CR_HEADER_PREFIX};
+use crate::client::{CR_HEADER_PREFIX, Client, RequestOptions};
 use crate::error::ApiResult;
 use crate::models::common::ListAllRes;
 use crate::models::explorer::*;
@@ -501,6 +501,13 @@ impl ExplorerApi for Client {
 
         if let Some(previous) = &params.previous {
             query_params.push(format!("previous={}", previous));
+        }
+
+        if let Some(version_session) = &params.version_session {
+            query_params.push(format!(
+                "version_session={}",
+                urlencoding::encode(version_session)
+            ));
         }
 
         let query = format!("?{}", query_params.join("&"));

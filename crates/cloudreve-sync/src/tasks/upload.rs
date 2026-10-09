@@ -110,6 +110,7 @@ impl<'a> UploadTask<'a> {
         }
 
         if placeholder_file.local_file_info.in_sync()
+            && !self.task.payload.force_upload
             && !placeholder_file.local_file_info.is_directory()
         {
             info!(
@@ -252,6 +253,7 @@ impl<'a> UploadTask<'a> {
                 &FileUpdateService {
                     uri,
                     previous: Some(etag),
+                    version_session: self.task.payload.version_session.clone(),
                 },
                 Bytes::new(),
             )
@@ -309,6 +311,7 @@ impl<'a> UploadTask<'a> {
             }),
             overwrite: !is_new_file || self.task.payload.force_override,
             previous_version,
+            version_session: self.task.payload.version_session.clone(),
             task_id: self.task.task_id.clone(),
             drive_id: self.drive_id.to_string(),
         };

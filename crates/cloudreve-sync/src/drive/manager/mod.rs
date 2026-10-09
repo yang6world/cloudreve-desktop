@@ -4,12 +4,13 @@ mod types;
 
 pub use types::*;
 
+use crate::EventBroadcaster;
 use crate::drive::commands::ManagerCommand;
 use crate::drive::mounts::{Credentials, DriveConfig, Mount};
-use crate::EventBroadcaster;
 use crate::inventory::InventoryDb;
 use crate::tasks::TaskProgress;
 use anyhow::{Context, Result};
+use cloudreve_api::models::explorer::FileResponse;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -229,6 +230,24 @@ impl DriveManager {
         None
     }
 
+    /// Resolve a local Office document to its Cloudreve file response.
+    pub async fn office_file_info(&self, path: PathBuf) -> Result<FileResponse> {
+        let mount = self
+            .search_drive_by_child_path(path.to_string_lossy().as_ref())
+            .await
+            .context("No Cloudreve drive contains this document")?;
+        mount.office_file_info(path).await
+    }
+
+    /// Restore a Cloudreve version for a local Office document.
+    pub async fn office_restore_version(&self, path: PathBuf, version: String) -> Result<()> {
+        let mount = self
+            .search_drive_by_child_path(path.to_string_lossy().as_ref())
+            .await
+            .context("No Cloudreve drive contains this document")?;
+        mount.office_restore_version(path, version).await
+    }
+
     /// Remove a drive by ID
     ///
     /// This will:
@@ -272,12 +291,16 @@ impl DriveManager {
 
     /// List all drives
     pub async fn list_drives(&self) -> Vec<DriveConfig> {
-        // let read_guard = self.drives.read().await;
-        // read_guard
-        //     .values()
-        //     .map(|mount| mount.get_config())
-        //     .collect()
-        Vec::new()
+        let mounts = {
+            let read_guard = self.drives.read().await;
+            read_guard.values().cloned().collect::<Vec<_>>()
+        };
+
+        let mut drives = Vec::with_capacity(mounts.len());
+        for mount in mounts {
+            drives.push(mount.get_config().await);
+        }
+        drives
     }
 
     /// Update drive configuration
@@ -483,7 +506,10 @@ impl DriveManager {
             .into_iter()
             .map(|task| {
                 let progress = progress_map.remove(&task.id);
-                TaskWithProgress { task, live_progress: progress }
+                TaskWithProgress {
+                    task,
+                    live_progress: progress,
+                }
             })
             .collect();
 
@@ -648,7 +674,11 @@ impl DriveManager {
 impl DriveManager {
     /// Get capacity summary from a mount's drive props.
     /// Only returns capacity if the remote_path filesystem is "my".
-    fn get_capacity_summary(mount: &Mount, drive_id: &str, remote_path: &str) -> Option<CapacitySummary> {
+    fn get_capacity_summary(
+        mount: &Mount,
+        drive_id: &str,
+        remote_path: &str,
+    ) -> Option<CapacitySummary> {
         // Only show capacity for "my" filesystem
         use cloudreve_api::models::uri::CrUri;
         let is_my_fs = CrUri::new(remote_path)

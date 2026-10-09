@@ -1,5 +1,16 @@
 // @generated automatically by Diesel CLI.
 diesel::table! {
+    edit_sessions (drive_id, local_path) {
+        drive_id -> Text,
+        local_path -> Text,
+        session_id -> Text,
+        open_count -> Integer,
+        state -> Text,
+        updated_at -> BigInt,
+    }
+}
+
+diesel::table! {
     file_metadata (id) {
         id -> BigInt,
         drive_id -> Text,

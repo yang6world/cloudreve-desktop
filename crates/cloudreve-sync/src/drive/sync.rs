@@ -620,7 +620,7 @@ impl Mount {
 
                 if let Err(err) = self
                     .task_queue
-                    .enqueue(TaskPayload::upload(path.clone()))
+                    .enqueue(self.upload_payload(path.clone()))
                     .await
                 {
                     tracing::error!(
@@ -712,7 +712,7 @@ impl Mount {
                 );
                 if let Err(err) = self
                     .task_queue
-                    .enqueue(TaskPayload::upload(path.clone()))
+                    .enqueue(self.upload_payload(path.clone()))
                     .await
                 {
                     tracing::error!(

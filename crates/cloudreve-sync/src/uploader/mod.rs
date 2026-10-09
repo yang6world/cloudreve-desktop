@@ -66,6 +66,8 @@ pub struct UploadParams {
     pub overwrite: bool,
     /// Previous version ETag (optional)
     pub previous_version: String,
+    /// Stable identifier shared by all backups in one desktop editing session.
+    pub version_session: Option<String>,
     /// Task ID for linking with task queue
     pub task_id: String,
     /// Drive ID
@@ -276,6 +278,7 @@ impl Uploader {
             } else {
                 Some(params.previous_version.clone())
             },
+            version_session: params.version_session.clone(),
             entity_type: if params.overwrite {
                 Some("version".to_string())
             } else {

@@ -69,7 +69,11 @@ pub struct FolderSummary {
 pub struct ExtendedInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_policy: Option<StoragePolicy>,
+    // Older Cloudreve servers omit these fields when no policy is mounted.
+    // Treat omitted values as the server defaults to preserve compatibility.
+    #[serde(default)]
     pub storage_policy_inherited: bool,
+    #[serde(default)]
     pub storage_used: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shares: Option<Vec<Share>>,
@@ -396,6 +400,8 @@ pub struct FileUpdateService {
     pub uri: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version_session: Option<String>,
 }
 
 /// Upload credential
@@ -484,6 +490,8 @@ pub struct UploadSessionRequest {
     pub encryption_supported: Option<Vec<EncryptionCipher>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version_session: Option<String>,
 }
 
 /// Metadata key constants

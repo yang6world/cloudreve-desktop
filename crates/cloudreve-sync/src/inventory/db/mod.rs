@@ -1,4 +1,5 @@
 mod drive_props;
+mod edit_sessions;
 mod file_metadata;
 mod tasks;
 mod upload_sessions;
@@ -6,9 +7,9 @@ mod upload_sessions;
 pub use tasks::RecentTasks;
 
 use anyhow::{Context, Result, anyhow};
-use diesel::Connection;
 use diesel::r2d2::{ConnectionManager, Pool, PooledConnection};
 use diesel::sqlite::SqliteConnection;
+use diesel::{Connection, RunQueryDsl};
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use dirs::home_dir;
 use std::fs;
@@ -78,5 +79,10 @@ fn run_migrations(database_url: &str) -> Result<()> {
         .with_context(|| format!("Failed to open inventory database at {}", database_url))?;
     conn.run_pending_migrations(MIGRATIONS)
         .map_err(|err| anyhow!("Failed to run inventory database migrations: {err}"))?;
+    // Cloud Files handles do not survive a Desktop restart. Starting the next
+    // Office open with a fresh ID preserves the prior cloud state as history.
+    diesel::sql_query("DELETE FROM edit_sessions")
+        .execute(&mut conn)
+        .context("Failed to recover interrupted edit sessions")?;
     Ok(())
 }

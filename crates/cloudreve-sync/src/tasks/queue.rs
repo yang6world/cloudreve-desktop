@@ -46,6 +46,8 @@ pub struct TaskQueue {
     task_handles: DashMap<String, JoinHandle<()>>,
     /// Maps task_id to local_path for running tasks, used for path-based cancellation
     task_paths: DashMap<String, String>,
+    /// Latest upload event received while an upload for the same path is active.
+    pending_uploads: DashMap<String, TaskPayload>,
 }
 
 impl TaskQueue {
@@ -79,6 +81,7 @@ impl TaskQueue {
             progress: Arc::new(DashMap::new()),
             task_handles: DashMap::new(),
             task_paths: DashMap::new(),
+            pending_uploads: DashMap::new(),
         });
 
         queue.spawn_dispatcher(command_rx).await;
@@ -142,6 +145,15 @@ impl TaskQueue {
             .with_context(|| format!("Failed to persist task {}", task_id))?;
 
         if !inserted {
+            if matches!(payload.kind, TaskKind::Upload) {
+                // Do not lose a save that arrives while a large upload is in
+                // flight. The completed task will dispatch this latest state.
+                self.pending_uploads.insert(
+                    payload.local_path_display(),
+                    payload.clone().with_force_upload(true),
+                );
+                return Ok(task_id);
+            }
             return Err(anyhow!(
                 "Task already exists for {} with type {}",
                 payload.local_path_display(),
@@ -212,6 +224,7 @@ impl TaskQueue {
         self.task_handles.clear();
         self.task_paths.clear();
         self.progress.clear();
+        self.pending_uploads.clear();
     }
 
     /// Cancel all tasks for a given path or its descendants.
@@ -223,6 +236,7 @@ impl TaskQueue {
     /// Returns the number of tasks that were cancelled.
     pub async fn cancel_by_path(&self, path: impl AsRef<std::path::Path>) -> Result<usize> {
         let path_str = path.as_ref().to_string_lossy().to_string();
+        self.pending_uploads.remove(&path_str);
 
         info!(
             target: "tasks::queue",
@@ -437,6 +451,7 @@ impl TaskQueue {
                         "Failed to mark task as completed"
                     );
                 }
+                self.dispatch_pending_upload(&task.payload.local_path).await;
             }
             Ok(TaskRunState::Cancelled) => {
                 if let Err(err) = self.inventory.update_task(
@@ -589,6 +604,23 @@ impl TaskQueue {
     async fn cleanup_task_entry(&self, task_id: &str) {
         self.progress.remove(task_id);
         self.task_paths.remove(task_id);
+    }
+
+    async fn dispatch_pending_upload(&self, path: &std::path::Path) {
+        let path_key = path.to_string_lossy().into_owned();
+        let Some((_, payload)) = self.pending_uploads.remove(&path_key) else {
+            return;
+        };
+
+        if let Err(error) = self.enqueue(payload).await {
+            warn!(
+                target: "tasks::queue",
+                drive = %self.drive_id,
+                path = %path.display(),
+                error = %error,
+                "Failed to dispatch deferred upload"
+            );
+        }
     }
 
     async fn resume_incomplete_tasks(self: &Arc<Self>) -> Result<()> {

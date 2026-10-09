@@ -165,6 +165,11 @@ impl SyncFilter for CallbackHandler {
 
     fn closed(&self, request: Request, info: info::Closed) {
         tracing::debug!(target: "drive::mounts", id = %self.id, path = %request.path().display(), deleted = %info.deleted(), "Closed");
+        if let Err(error) = self.command_tx.send(MountCommand::FileClosed {
+            path: request.path().to_path_buf(),
+        }) {
+            tracing::warn!(target: "drive::mounts", id = %self.id, error = %error, "Failed to queue file close");
+        }
     }
 
     fn cancel_fetch_data(&self, _request: Request, _info: info::CancelFetchData) {
@@ -187,6 +192,11 @@ impl SyncFilter for CallbackHandler {
 
     fn opened(&self, request: Request, _info: info::Opened) {
         tracing::debug!(target: "drive::mounts", id = %self.id, path = %request.path().display(), "Opened");
+        if let Err(error) = self.command_tx.send(MountCommand::FileOpened {
+            path: request.path().to_path_buf(),
+        }) {
+            tracing::warn!(target: "drive::mounts", id = %self.id, error = %error, "Failed to queue file open");
+        }
     }
 
     fn dehydrate(

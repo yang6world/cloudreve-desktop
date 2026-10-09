@@ -434,7 +434,14 @@ impl Client {
 
         // Execute request
         let response = request.send().await?;
+        let response_status = response.status();
         let response_text = response.text().await?;
+
+        // Some Cloudreve mutation endpoints return HTTP 204 or an empty 2xx
+        // response after completing successfully. Deserialize only when a body exists.
+        if response_status.is_success() && response_text.trim().is_empty() {
+            return Ok(R::default());
+        }
 
         // First parse as a generic Value to check the error code
         let raw_value: serde_json::Value = serde_json::from_str(&response_text)?;

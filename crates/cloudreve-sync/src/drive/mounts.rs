@@ -1,3 +1,4 @@
+use crate::cfapi::placeholder::{LocalFileInfo, PinState};
 use crate::cfapi::root::{
     Connection, HydrationType, PopulationType, SecurityId, Session, SyncRootId, SyncRootIdBuilder,
     SyncRootInfo,
@@ -7,14 +8,17 @@ use crate::drive::commands::ManagerCommand;
 use crate::drive::commands::MountCommand;
 use crate::drive::event_blocker::EventBlocker;
 use crate::drive::ignore::IgnoreMatcher;
+use crate::drive::placeholder::CrPlaceholder;
 use crate::drive::sync::group_fs_events;
 use crate::drive::utils::recycle_bin_url;
 use crate::inventory::{DrivePropsUpdate, InventoryDb, TaskRecord};
-use crate::tasks::{TaskProgress, TaskQueue, TaskQueueConfig};
+use crate::tasks::{TaskPayload, TaskProgress, TaskQueue, TaskQueueConfig};
 use crate::utils::toast;
 use ::serde::{Deserialize, Serialize};
 use anyhow::{Context, Result};
+use cloudreve_api::api::explorer::ExplorerApi;
 use cloudreve_api::api::user::UserApi;
+use cloudreve_api::models::explorer::{FileResponse, GetFileInfoService, VersionControlService};
 use cloudreve_api::{Client, ClientConfig, models::user::Token};
 use notify_debouncer_full::notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer};
@@ -29,7 +33,15 @@ use tokio::spawn;
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::task::JoinHandle;
 use url::Url;
+use uuid::Uuid;
 use windows::Storage::Provider::StorageProviderSyncRootManager;
+
+/// How long a version restore waits for the Office editing session of the
+/// document to end. The session is released a few seconds after Office removes
+/// its owner lock, so restoring right after a close needs a grace period.
+const OFFICE_RESTORE_SESSION_WAIT: Duration = Duration::from_secs(25);
+const OFFICE_RESTORE_SESSION_POLL: Duration = Duration::from_millis(400);
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DriveConfig {
     pub id: String,
@@ -263,6 +275,137 @@ impl Mount {
         self.config.read().await.clone()
     }
 
+    /// Fetch the remote file and its retained entities for the Office add-in.
+    pub async fn office_file_info(&self, path: PathBuf) -> Result<FileResponse> {
+        let config = self.config.read().await.clone();
+        let uri =
+            crate::drive::utils::local_path_to_cr_uri(path, config.sync_path, config.remote_path)?;
+        self.cr_client
+            .get_file_info(&GetFileInfoService {
+                uri: Some(uri.to_string()),
+                id: None,
+                extended: Some(true),
+                folder_summary: None,
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))
+    }
+
+    /// Restore a retained entity as the current file version.
+    pub async fn office_restore_version(&self, path: PathBuf, version: String) -> Result<()> {
+        let config = self.config.read().await.clone();
+        let uri = crate::drive::utils::local_path_to_cr_uri(
+            path.clone(),
+            config.sync_path.clone(),
+            config.remote_path,
+        )?;
+
+        // The add-in closes the document immediately before restoring, but the
+        // editing session outlives the owner lock so the final save still lands
+        // on the same version. Wait for that session and its upload to finish:
+        // cancelling instead would throw away the content the user just saved,
+        // and restoring alongside it would let the upload win.
+        self.wait_for_idle_document(&path).await?;
+
+        self.cr_client
+            .set_current_version(&VersionControlService {
+                uri: uri.to_string(),
+                version,
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+
+        self.pull_restored_version(&path, &uri.to_string(), &config.sync_path)
+            .await
+    }
+
+    /// Wait until no Office editing session and no queued transfer touch `path`.
+    async fn wait_for_idle_document(&self, path: &Path) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + OFFICE_RESTORE_SESSION_WAIT;
+        loop {
+            let session_active = self
+                .inventory
+                .version_session_for_path(&self.id, path)?
+                .is_some();
+            if !session_active && !self.has_active_task(path) {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                if session_active {
+                    anyhow::bail!(
+                        "The Office document is still open; close it before restoring a version"
+                    );
+                }
+                anyhow::bail!("A sync task for this document is still running; try again once it finishes");
+            }
+            tokio::time::sleep(OFFICE_RESTORE_SESSION_POLL).await;
+        }
+    }
+
+    /// True when the queue holds a pending or running transfer for `path`.
+    fn has_active_task(&self, path: &Path) -> bool {
+        match self.task_queue.list_active_tasks() {
+            Ok(tasks) => tasks
+                .iter()
+                .any(|task| Path::new(&task.local_path) == path),
+            Err(error) => {
+                tracing::warn!(
+                    target: "drive::mounts",
+                    path = %path.display(),
+                    error = %error,
+                    "Failed to inspect active tasks before restoring a version"
+                );
+                false
+            }
+        }
+    }
+
+    /// Bring the local copy in line with the version that was just made current.
+    ///
+    /// Selecting a version only moves the pointer on the server. Without this
+    /// the file on disk keeps the previous content, and the next reconciliation
+    /// sees a local file that disagrees with the remote entity and uploads the
+    /// old bytes back, silently undoing the restore.
+    async fn pull_restored_version(
+        &self,
+        path: &Path,
+        uri: &str,
+        sync_root: &Path,
+    ) -> Result<()> {
+        let remote = self
+            .cr_client
+            .get_file_info(&GetFileInfoService {
+                uri: Some(uri.to_string()),
+                id: None,
+                extended: None,
+                folder_summary: None,
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+
+        let drive_id = Uuid::parse_str(&self.id)?;
+        let local = LocalFileInfo::from_path(path).unwrap_or(LocalFileInfo::missing());
+        // Pinned files must stay hydrated, so they are re-downloaded instead of
+        // being invalidated. Everything else is dehydrated — including partially
+        // hydrated files, whose on-disk ranges belong to the replaced version —
+        // and hydrates from the restored entity when the document is opened.
+        let pinned = local.pinned() == PinState::Pinned;
+
+        CrPlaceholder::new(path.to_path_buf(), sync_root.to_path_buf(), drive_id)
+            .with_invalidate_all_range(!pinned)
+            .with_remote_file(&remote)
+            .commit(self.inventory.clone())
+            .context("failed to apply the restored version to the local file")?;
+
+        if pinned {
+            self.task_queue
+                .enqueue(TaskPayload::download(path.to_path_buf()))
+                .await?;
+        }
+
+        Ok(())
+    }
+
     /// Get the sync path for the drive
     pub async fn get_sync_path(&self) -> PathBuf {
         self.config.read().await.sync_path.clone()
@@ -409,7 +552,10 @@ impl Mount {
             }
             sync_root_info.set_version("1.0.0");
             sync_root_info
-                .set_recycle_bin_uri(recycle_bin_url(&config).unwrap_or_else(|_| "https://cloudreve.org".to_string()))
+                .set_recycle_bin_uri(
+                    recycle_bin_url(&config)
+                        .unwrap_or_else(|_| "https://cloudreve.org".to_string()),
+                )
                 .context("failed to set recycle bin uri")?;
             sync_root_info
                 .set_path(Path::new(&config.sync_path))
@@ -504,6 +650,12 @@ impl Mount {
             tracing::trace!(target: "drive::mounts", id = %mount_id, command = ?command, "Processing command");
 
             match command {
+                MountCommand::FileOpened { path } => {
+                    s.office_file_opened(&path);
+                }
+                MountCommand::FileClosed { path } => {
+                    s.office_file_closed(path);
+                }
                 MountCommand::Rename {
                     source,
                     target,
@@ -522,7 +674,11 @@ impl Mount {
                         let _ = response.send(result);
                     });
                 }
-                MountCommand::Sync { mode, local_paths, user_initiated } => {
+                MountCommand::Sync {
+                    mode,
+                    local_paths,
+                    user_initiated,
+                } => {
                     let s_clone = s.clone();
                     let mount_id_clone = mount_id.clone();
                     spawn(async move {
@@ -630,7 +786,9 @@ impl Mount {
     pub async fn delete(&self) -> Result<()> {
         self.shutdown().await;
         if let Some(ref connection) = self.connection {
-            connection.disconnect().context("faield to disconnect sync root")?;
+            connection
+                .disconnect()
+                .context("faield to disconnect sync root")?;
         }
         self.task_queue.shutdown().await;
         if let Some(sync_root_id) = self.config.read().await.sync_root_id.as_ref() {

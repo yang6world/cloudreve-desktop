@@ -1,5 +1,8 @@
 use anyhow::Context;
-use cloudreve_sync::{ConfigManager, DriveManager, EventBroadcaster, LogConfig, LogGuard, shellext::shell_service::ServiceHandle};
+use cloudreve_sync::{
+    shellext::shell_service::ServiceHandle, ConfigManager, DriveManager, EventBroadcaster,
+    LogConfig, LogGuard,
+};
 use std::sync::{Arc, Mutex};
 use tauri::{
     async_runtime::spawn,
@@ -13,6 +16,7 @@ use tokio::sync::OnceCell;
 use crate::commands::{show_add_drive_window_impl, show_main_window, show_settings_window_impl};
 mod commands;
 mod event_handler;
+mod office_bridge;
 
 #[macro_use]
 extern crate rust_i18n;
@@ -82,6 +86,11 @@ async fn init_sync_service(app: AppHandle) -> anyhow::Result<()> {
     // Spawn command processor for DriveManager
     drive_manager.spawn_command_processor().await;
     tracing::info!(target: "main", "DriveManager command processor started");
+
+    // Start the loopback bridge before loading drives. Office can open while
+    // Desktop initializes, and the add-in should never mistake that for a
+    // stopped Desktop process.
+    spawn(office_bridge::start(drive_manager.clone()));
 
     // Load drive configurations from disk
     drive_manager
@@ -193,13 +202,8 @@ fn setup_tray(app: &tauri::App) -> anyhow::Result<()> {
         true,
         None::<&str>,
     )?;
-    let settings_i = MenuItem::with_id(
-        app,
-        "settings",
-        t!("settings").as_ref(),
-        true,
-        None::<&str>,
-    )?;
+    let settings_i =
+        MenuItem::with_id(app, "settings", t!("settings").as_ref(), true, None::<&str>)?;
     let quit_i = MenuItem::with_id(app, "quit", t!("quit").as_ref(), true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show_i, &add_drive_i, &settings_i, &quit_i])?;
 

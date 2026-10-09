@@ -1,5 +1,6 @@
 pub mod callback;
 pub mod commands;
+pub(crate) mod edit_sessions;
 pub mod event_blocker;
 pub mod ignore;
 pub mod manager;

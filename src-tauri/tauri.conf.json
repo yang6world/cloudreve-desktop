@@ -7,7 +7,7 @@
     "frontendDist": "../ui/dist",
     "devUrl": "http://localhost:5173",
     "beforeDevCommand": "yarn run dev",
-    "beforeBuildCommand": "yarn run build"
+    "beforeBuildCommand": "npm run build"
   },
   "app": {
     "windows": [
@@ -37,7 +37,18 @@
   },
   "bundle": {
     "active": true,
-    "targets": [],
+    "targets": [
+      "nsis"
+    ],
+    "resources": {
+      "../office-addin/dist": "office-addin"
+    },
+    "windows": {
+      "nsis": {
+        "installerHooks": "installer-hooks.nsh",
+        "installMode": "currentUser"
+      }
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

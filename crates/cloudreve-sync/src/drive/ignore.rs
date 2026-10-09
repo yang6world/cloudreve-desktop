@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone)]
 pub struct IgnoreMatcher {
     globset: GlobSet,
-    /// Original patterns for debugging/logging
+    /// The user patterns that are in effect, without comments and blank lines
     patterns: Vec<String>,
     /// The sync root path - patterns are relative to this path
     sync_root: PathBuf,
@@ -37,6 +37,7 @@ impl IgnoreMatcher {
     /// - `#comment` - Lines starting with `#` are treated as comments
     pub fn new(patterns: &[String], sync_root: PathBuf) -> Result<Self> {
         let mut builder = GlobSetBuilder::new();
+        let mut effective_patterns = Vec::with_capacity(patterns.len());
 
         for pattern in patterns {
             let pattern = pattern.trim();
@@ -69,6 +70,7 @@ impl IgnoreMatcher {
             let glob = Glob::new(&glob_pattern)
                 .with_context(|| format!("Invalid ignore pattern: {}", pattern))?;
             builder.add(glob);
+            effective_patterns.push(pattern.to_string());
         }
 
         // Add default set for office temp files
@@ -82,7 +84,7 @@ impl IgnoreMatcher {
 
         Ok(Self {
             globset,
-            patterns: patterns.to_vec(),
+            patterns: effective_patterns,
             sync_root,
         })
     }
@@ -156,7 +158,7 @@ impl IgnoreMatcher {
         self.globset.is_match(filename)
     }
 
-    /// Get the original patterns for debugging/logging.
+    /// Get the user patterns in effect, for debugging/logging.
     pub fn patterns(&self) -> &[String] {
         &self.patterns
     }
@@ -166,14 +168,20 @@ impl IgnoreMatcher {
         &self.sync_root
     }
 
-    /// Check if the matcher has any patterns.
+    /// Check if the matcher has any user-configured pattern.
+    ///
+    /// The built-in rules for Office temporary files always apply, so
+    /// `is_match` can still return `true` for an empty matcher.
     pub fn is_empty(&self) -> bool {
-        self.globset.is_empty()
+        self.patterns.is_empty()
     }
 
-    /// Get the number of patterns.
+    /// Get the number of user-configured patterns in effect.
+    ///
+    /// Comments and blank lines are not counted, and neither are the built-in
+    /// rules for Office temporary files.
     pub fn len(&self) -> usize {
-        self.globset.len()
+        self.patterns.len()
     }
 }
 

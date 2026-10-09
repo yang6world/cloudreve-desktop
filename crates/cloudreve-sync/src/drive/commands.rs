@@ -11,7 +11,6 @@ use crate::{
         utils::{local_path_to_cr_uri, notify_shell_change},
     },
     inventory::ConflictState,
-    tasks::TaskPayload,
     utils::toast,
 };
 use anyhow::{Context, Result};
@@ -126,6 +125,12 @@ pub enum MountCommand {
     Renamed {
         source: PathBuf,
         destination: PathBuf,
+    },
+    FileOpened {
+        path: PathBuf,
+    },
+    FileClosed {
+        path: PathBuf,
     },
 }
 
@@ -359,22 +364,22 @@ impl Mount {
 
         tracing::debug!(target: "drive::mounts", uri = %uri.to_string(), "Fetch file list from cloudreve");
 
-        // Filter out files matching ignore patterns
+        // Filter out files matching ignore patterns. This runs even without a
+        // user pattern, because the matcher also carries the built-in rules for
+        // Office temporary files.
         let matcher = self.ignore_matcher.read().await;
-        if !matcher.is_empty() {
-            placehodlers.retain(|file| {
-                let local_file_path = path.join(&file.name);
-                let ignored = matcher.is_match(&local_file_path);
-                if ignored {
-                    tracing::trace!(
-                        target: "drive::commands",
-                        path = %local_file_path.display(),
-                        "Filtering ignored file from placeholders"
-                    );
-                }
-                !ignored
-            });
-        }
+        placehodlers.retain(|file| {
+            let local_file_path = path.join(&file.name);
+            let ignored = matcher.is_match(&local_file_path);
+            if ignored {
+                tracing::trace!(
+                    target: "drive::commands",
+                    path = %local_file_path.display(),
+                    "Filtering ignored file from placeholders"
+                );
+            }
+            !ignored
+        });
         drop(matcher);
 
         Ok(GetPlacehodlerResult {
@@ -586,6 +591,19 @@ impl Mount {
 
     pub async fn process_fs_events(&self, events: GroupedFsEvents) -> Result<()> {
         for (event_kind, events) in events {
+            // Office owner-lock files are ignored by sync, but their lifecycle
+            // is more reliable than CFAPI handle counts for session boundaries.
+            for event in &events {
+                let Some(path) = event.paths.first() else {
+                    continue;
+                };
+                match &event_kind {
+                    EventKind::Create(_) => self.office_owner_lock_created(path),
+                    EventKind::Remove(_) => self.office_owner_lock_removed(path),
+                    _ => {}
+                }
+            }
+
             // Filter out events that were pre-registered by rename operations
             let filtered_events = self.event_blocker.filter_events(events, &event_kind);
 
@@ -595,7 +613,8 @@ impl Mount {
                 .into_iter()
                 .filter(|event| {
                     let dominated_path = &event.paths[0];
-                    let is_ignored = matcher.is_match(dominated_path);
+                    let is_ignored = matcher.is_match(dominated_path)
+                        || crate::drive::edit_sessions::is_office_temporary_file(dominated_path);
                     if is_ignored {
                         tracing::trace!(
                             target: "drive::commands",
@@ -719,7 +738,10 @@ impl Mount {
 
                 if let Err(err) = self
                     .task_queue
-                    .enqueue(TaskPayload::upload(local_path.clone()).with_force_override(true))
+                    .enqueue(
+                        self.upload_payload(PathBuf::from(local_path.clone()))
+                            .with_force_override(true),
+                    )
                     .await
                 {
                     tracing::error!(
@@ -909,7 +931,7 @@ impl Mount {
             // General modification, quque a upload task if not exist
             if !placeholder_info.in_sync() {
                 tracing::debug!(target: "drive::commands", path = %path.display(), "Queuing upload task for modified file");
-                let payload = TaskPayload::upload(path.clone());
+                let payload = self.upload_payload(path.clone());
                 let result = self
                     .task_queue
                     .enqueue(payload)
@@ -940,7 +962,7 @@ impl Mount {
         );
 
         for (_remote_uri, path) in path_uri_mappings {
-            let payload = TaskPayload::upload(path.clone());
+            let payload = self.upload_payload(path.clone());
 
             self.task_queue
                 .enqueue(payload)

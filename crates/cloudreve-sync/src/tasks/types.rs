@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
 
+const VERSION_SESSION_STATE_KEY: &str = "cloudreve_version_session";
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TaskKind {
     Upload,
@@ -37,6 +39,11 @@ pub struct TaskPayload {
 
     // Upload
     pub force_override: bool,
+    /// Re-read a file after an earlier upload completed while it was changing.
+    /// Unlike force_override, this still sends the previous etag for conflict checks.
+    pub force_upload: bool,
+    /// Optional session ID used to coalesce repeated Office backups.
+    pub version_session: Option<String>,
 }
 
 impl TaskPayload {
@@ -50,6 +57,8 @@ impl TaskPayload {
             processed_bytes: None,
             custom_state: None,
             force_override: false,
+            force_upload: false,
+            version_session: None,
         }
     }
 
@@ -78,12 +87,38 @@ impl TaskPayload {
     }
 
     pub fn with_custom_state(mut self, state: Value) -> Self {
+        self.version_session = state
+            .get(VERSION_SESSION_STATE_KEY)
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
         self.custom_state = Some(state);
         self
     }
 
     pub fn with_force_override(mut self, force: bool) -> Self {
         self.force_override = force;
+        self
+    }
+
+    pub fn with_force_upload(mut self, force: bool) -> Self {
+        self.force_upload = force;
+        self
+    }
+
+    /// Attach an editing session ID and persist it through the task queue's
+    /// existing custom-state column, so resumed tasks keep the same session.
+    pub fn with_version_session(mut self, session: impl Into<String>) -> Self {
+        let session = session.into();
+        self.version_session = Some(session.clone());
+        let state = self
+            .custom_state
+            .get_or_insert_with(|| serde_json::json!({}));
+        if let Some(object) = state.as_object_mut() {
+            object.insert(
+                VERSION_SESSION_STATE_KEY.to_string(),
+                Value::String(session),
+            );
+        }
         self
     }
 

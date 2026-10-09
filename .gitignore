@@ -22,3 +22,7 @@ Cargo.lock
 /debug/
 dist/
 package/*.exe
+
+# ==== Ycloud local (keep at end of file to minimise upstream merge conflicts) ====
+# build-installer.ps1 / cargo tauri bundle logs
+*.log
